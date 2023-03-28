@@ -1,0 +1,197 @@
+---
+name: Lib - Create and Publish Docker Image (built with Kaniko) to JFROG Artifactory
+
+on:
+  workflow_call:
+    inputs:
+      WORKING_DIRECTORY:
+        required: true
+        type: string
+        description: "Artifact name"
+      APP_IMAGE_NAME:
+        required: true
+        type: string
+        description: "App docker image name"
+      APP_IMAGE_VERSION:
+        required: true
+        type: string
+        description: "App docker image version"
+      REGISTRY_REPO_NAME:
+        required: true
+        type: string
+        description: "Registry repo name"
+      RUNNER_LABEL:
+        type: string
+        description: The GitHub Ephemeral runner information in the format '["self-hosted", "<runner-label>"]'
+        default: '["ubuntu-latest"]'
+
+    secrets:
+      ARTIFACTORY_TOKEN:
+        required: true
+        description: "The artifactory authentication token"
+      ARTIFACTORY_USER_NAME:
+        required: true
+        description: "Github user for artifactory login"
+      ARTIFACTORY_USER_PASSWORD:
+        required: true
+        description: "Github user password for artifactory login"
+
+jobs:
+  docker:
+    name: Scan & Push
+    runs-on: ${{ fromJSON(inputs.RUNNER_LABEL) }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.WORKING_DIRECTORY }}
+
+    steps:
+      # Checkout the application code.
+      - uses: actions/checkout@v2
+
+      # Update github runner image
+      - name: Update github runner image
+        run: |
+          apt-get update
+          apt-get upgrade -y
+
+      - name: install required python libraries
+        run: |
+          pip3 install dohq-artifactory==0.8.3 semver==2.13.0
+
+      - name: PR Number & labels
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          # shellcheck disable=SC2296
+          echo "${{secrets.GITHUB_TOKEN}}" | gh auth login --with-token
+          COMMIT_SHA=$(git rev-parse HEAD)
+
+          # case 1 (pull request)
+          PR_NUMBER="${{ github.event.number }}"
+          GITHUB_SHA="${{ github.event.pull_request.head.sha }}"
+
+          # case 2 (merge commit)
+          if [ -z "$PR_NUMBER" ]
+          then
+            PR_NUMBER=$(gh pr list --search "$COMMIT_SHA" --state merged --json number | jq '.[] | .number')
+            GITHUB_SHA="$COMMIT_SHA"
+            echo "COMMIT: merge commit"
+          else
+            echo "COMMIT: PR commit"
+          fi
+
+          # semicolon separated labels
+          LABELS="$(gh pr view "${PR_NUMBER}" --json labels --jq '.labels.[].name' | paste -sd ";")"
+          echo "GITHUB_SHA: $GITHUB_SHA"
+          echo "LABELS: $LABELS"
+
+          # passing vars to other steps
+          {
+            echo "PR_NUMBER=${PR_NUMBER}"
+            echo "LABELS=${LABELS}"
+            echo "GITHUB_SHA=${GITHUB_SHA}"
+          } >> "$GITHUB_ENV"
+
+      - name: sem-ver.py (get image version)
+        run: |
+          # run semantic versioning python script
+          SCRIPT_OUTPUT=$(ARTIFACTORY_USER_NAME=${{ secrets.ARTIFACTORY_USER_NAME }} \
+          ARTIFACTORY_USER_PASSWORD=${{ secrets.ARTIFACTORY_USER_PASSWORD }} \
+          ARTIFACTORY_TOKEN=${{ secrets.ARTIFACTORY_TOKEN }} \
+          PR_NUMBER=${PR_NUMBER} \
+          GITHUB_SHA=${GITHUB_SHA} \
+          LABELS=${LABELS} \
+          REGISTRY_REPO_NAME=${{ inputs.REGISTRY_REPO_NAME }} \
+          APP_IMAGE_NAME=${{ inputs.APP_IMAGE_NAME }} \
+          python3 "${GITHUB_WORKSPACE}"/.github/scripts/cpe-semantic-versioning/sem-ver.py)
+
+          # display script output
+          echo "${SCRIPT_OUTPUT}"
+
+          # get APP_IMAGE_VERSION, COMMIT_HASH
+          APP_IMAGE_VERSION=$(echo "$SCRIPT_OUTPUT" | tail -n 1 | jq '.APP_IMAGE_VERSION')
+          COMMIT_HASH=$(echo "$SCRIPT_OUTPUT" | tail -n 1 | jq '.COMMIT_HASH')
+
+          # passing vars to other steps
+          echo "APP_IMAGE_VERSION=${APP_IMAGE_VERSION}" >> "$GITHUB_ENV"
+          echo "COMMIT_HASH=${COMMIT_HASH}" >> "$GITHUB_ENV"
+
+      # Build Image locally with Kaniko (tarball image)
+      - name: Build Image locally with Kaniko
+        run: |
+          /kaniko/executor \
+          --destination=image \
+          --tarPath=/workspace/image.tar \
+          --context="." \
+          --single-snapshot \
+          --no-push
+
+      # Setup JFROG CLI
+      - name: Setup JFROG CLI
+        uses: jfrog/setup-jfrog-cli@v3
+        env:
+          # Config Token
+          JF_ENV_1: ${{ secrets.ARTIFACTORY_TOKEN }}
+
+      # Pinging Artifactory
+      - name: Pinging Artifactory
+        run: |
+          Pinging Artifactory...
+          jf rt ping
+
+      # Scanning the image with XRAY (tarball image)
+      - name: Run XRAY Scan
+        continue-on-error: true
+        run: |
+          jf scan "/workspace/image.tar" --extended-table=true --watches "GitHubWatch"
+
+      # Configure Kaniko (auth to JFROG)
+      - name: Configure Kaniko (auth to JFROG)
+        env:
+          REGISTRY: opensystems.jfrog.io/${{ inputs.REGISTRY_REPO_NAME }}
+          REGISTRY_USERNAME: ${{ secrets.ARTIFACTORY_USER_NAME }}
+          REGISTRY_PASSWORD: ${{ secrets.ARTIFACTORY_USER_PASSWORD }}
+        run: |
+          echo "{\"auths\":{\"$REGISTRY\":{\"auth\":\"$(echo -n "$REGISTRY_USERNAME":"$REGISTRY_PASSWORD" | base64)\"}}}" > /kaniko/.docker/config.json
+
+      # Push Build to JFROG Artifactory
+      - name: Push Build to JFROG Artifactory
+        run: |
+          /kaniko/executor \
+          --context "." \
+          --dockerfile "Dockerfile" \
+          --verbosity info \
+          --destination opensystems.jfrog.io/${{ inputs.REGISTRY_REPO_NAME }}/${{ inputs.APP_IMAGE_NAME }}:${{ env.APP_IMAGE_VERSION }}
+
+      - name: sem-ver.py (get destination of pushed Docker image)
+        run: |  
+          # run semantic versioning python script
+          SCRIPT_OUTPUT=$(ARTIFACTORY_USER_NAME=${{ secrets.ARTIFACTORY_USER_NAME }} \
+          ARTIFACTORY_USER_PASSWORD=${{ secrets.ARTIFACTORY_USER_PASSWORD }} \
+          ARTIFACTORY_TOKEN=${{ secrets.ARTIFACTORY_TOKEN }} \
+          PR_NUMBER=${PR_NUMBER} \
+          GITHUB_SHA=${GITHUB_SHA} \
+          LABELS=${LABELS} \
+          REGISTRY_REPO_NAME=${{ inputs.REGISTRY_REPO_NAME }} \
+          APP_IMAGE_NAME=${{ inputs.APP_IMAGE_NAME }} \
+          USED_IMAGE_VERSION=${{ env.APP_IMAGE_VERSION }} \
+          python3 "${GITHUB_WORKSPACE}"/.github/scripts/cpe-semantic-versioning/sem-ver.py)
+
+          # display script output
+          echo "${SCRIPT_OUTPUT}"
+
+          # get DESTINATION
+          DESTINATION=$(echo "$SCRIPT_OUTPUT" | tail -n 1 | jq '.DESTINATION')
+
+          # passing vars to other steps
+          echo "DESTINATION=${DESTINATION}" >> "$GITHUB_ENV"
+
+      - name: set properties for published npm packages
+        run: |
+          # add properties for pushed Docker image
+          jf rt sp --include-dirs ${{ env.DESTINATION }} "commit_hash=$(echo "$COMMIT_HASH" | tr -d '"');pr_number=${PR_NUMBER}"
+
+      # Publish JFROG Build Info
+      - name: Publish JFROG Build Info
+        run: |
+          jf rt bp ${{ inputs.APP_IMAGE_NAME }} ${{ env.APP_IMAGE_VERSION }}
